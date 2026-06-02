@@ -1,437 +1,245 @@
-import fs from 'fs';
-import https from 'https';
-import path from 'path';
+/**
+ * Telegram channel adapter (v2) — uses Chat SDK bridge, with a pairing
+ * interceptor wrapped around onInbound to verify chat ownership before
+ * registration. See telegram-pairing.ts for the why.
+ */
+import { createTelegramAdapter } from '@chat-adapter/telegram';
 
-import { Api, Bot } from 'grammy';
-
-import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
 import { readEnvFile } from '../env.js';
-import { resolveGroupFolderPath } from '../group-folder.js';
-import { logger } from '../logger.js';
-import { registerChannel, ChannelOpts } from './registry.js';
-import {
-  Channel,
-  OnChatMetadata,
-  OnInboundMessage,
-  RegisteredGroup,
-} from '../types.js';
+import { log } from '../log.js';
+import { createMessagingGroup, getMessagingGroupByPlatform, updateMessagingGroup } from '../db/messaging-groups.js';
+import { grantRole, hasAnyOwner } from '../modules/permissions/db/user-roles.js';
+import { upsertUser } from '../modules/permissions/db/users.js';
+import { createChatSdkBridge, type ReplyContext } from './chat-sdk-bridge.js';
+import { sanitizeTelegramLegacyMarkdown } from './telegram-markdown-sanitize.js';
+import { registerChannelAdapter } from './channel-registry.js';
+import type { ChannelAdapter, ChannelSetup, InboundMessage } from './adapter.js';
+import { tryConsume } from './telegram-pairing.js';
 
-export interface TelegramChannelOpts {
-  onMessage: OnInboundMessage;
-  onChatMetadata: OnChatMetadata;
-  registeredGroups: () => Record<string, RegisteredGroup>;
+/**
+ * Retry a one-shot operation that can fail on transient network errors at
+ * cold-start (DNS hiccups, brief upstream outages). Exponential backoff capped
+ * at 5 attempts — if the network is truly down we surface it instead of
+ * hanging the service indefinitely.
+ */
+async function withRetry<T>(fn: () => Promise<T>, label: string, maxAttempts = 5): Promise<T> {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (attempt === maxAttempts) break;
+      const delay = Math.min(16000, 1000 * 2 ** (attempt - 1));
+      log.warn('Telegram setup failed, retrying', { label, attempt, delayMs: delay, err });
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+  throw lastErr;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function extractReplyContext(raw: Record<string, any>): ReplyContext | null {
+  if (!raw.reply_to_message) return null;
+  const reply = raw.reply_to_message;
+  return {
+    text: reply.text || reply.caption || '',
+    sender: reply.from?.first_name || reply.from?.username || 'Unknown',
+  };
+}
+
+/** Look up the bot username via Telegram getMe. Cached after first call. */
+async function fetchBotUsername(token: string): Promise<string | null> {
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${token}/getMe`);
+    const json = (await res.json()) as { ok: boolean; result?: { username?: string } };
+    return json.ok ? (json.result?.username ?? null) : null;
+  } catch (err) {
+    log.warn('Telegram getMe failed', { err });
+    return null;
+  }
+}
+
+function isGroupPlatformId(platformId: string): boolean {
+  // platformId is "telegram:<chatId>". Negative chat IDs are groups/channels.
+  const id = platformId.split(':').pop() ?? '';
+  return id.startsWith('-');
+}
+
+interface InboundFields {
+  text: string;
+  authorUserId: string | null;
+}
+
+function readInboundFields(message: InboundMessage): InboundFields {
+  if (message.kind !== 'chat-sdk' || !message.content || typeof message.content !== 'object') {
+    return { text: '', authorUserId: null };
+  }
+  const c = message.content as { text?: string; author?: { userId?: string } };
+  return { text: c.text ?? '', authorUserId: c.author?.userId ?? null };
 }
 
 /**
- * Send a message with Telegram Markdown parse mode, falling back to plain text.
- * Claude's output naturally matches Telegram's Markdown v1 format:
- *   *bold*, _italic_, `code`, ```code blocks```, [links](url)
+ * Build an onInbound interceptor that consumes pairing codes before they
+ * reach the router. On match: records the chat + its paired user, promotes
+ * the user to owner if the instance has no owner yet, and short-circuits.
+ * On miss: forwards to the host.
  */
-async function sendTelegramMessage(
-  api: { sendMessage: Api['sendMessage'] },
-  chatId: string | number,
-  text: string,
-  options: { message_thread_id?: number } = {},
-): Promise<void> {
+/**
+ * Send a one-shot confirmation back to the paired chat. Best-effort — failures
+ * are logged but never propagated, so a Telegram outage can't undo a successful
+ * pairing or trigger the interceptor's fail-open path.
+ */
+async function sendPairingConfirmation(token: string, platformId: string): Promise<void> {
+  const chatId = platformId.split(':').slice(1).join(':');
+  if (!chatId) return;
   try {
-    await api.sendMessage(chatId, text, {
-      ...options,
-      parse_mode: 'Markdown',
+    const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: 'Pairing success! Head back to the NanoClaw installer to finish setup.',
+      }),
     });
+    if (!res.ok) {
+      log.warn('Telegram pairing confirmation non-OK', { status: res.status });
+    }
   } catch (err) {
-    // Fallback: send as plain text if Markdown parsing fails
-    logger.debug({ err }, 'Markdown send failed, falling back to plain text');
-    await api.sendMessage(chatId, text, options);
+    log.warn('Telegram pairing confirmation failed', { err });
   }
 }
 
-export class TelegramChannel implements Channel {
-  name = 'telegram';
-
-  private bot: Bot | null = null;
-  private opts: TelegramChannelOpts;
-  private botToken: string;
-
-  constructor(botToken: string, opts: TelegramChannelOpts) {
-    this.botToken = botToken;
-    this.opts = opts;
-  }
-
-  /**
-   * Download a Telegram file to the group's attachments directory.
-   * Returns the container-relative path (e.g. /workspace/group/attachments/photo_123.jpg)
-   * or null if the download fails.
-   */
-  private async downloadFile(
-    fileId: string,
-    groupFolder: string,
-    filename: string,
-  ): Promise<string | null> {
-    if (!this.bot) return null;
-
+function createPairingInterceptor(
+  botUsernamePromise: Promise<string | null>,
+  hostOnInbound: ChannelSetup['onInbound'],
+  token: string,
+): ChannelSetup['onInbound'] {
+  return async (platformId, threadId, message) => {
     try {
-      const file = await this.bot.api.getFile(fileId);
-      if (!file.file_path) {
-        logger.warn({ fileId }, 'Telegram getFile returned no file_path');
-        return null;
-      }
-
-      const groupDir = resolveGroupFolderPath(groupFolder);
-      const attachDir = path.join(groupDir, 'attachments');
-      fs.mkdirSync(attachDir, { recursive: true });
-
-      // Sanitize filename and add extension from Telegram's file_path if missing
-      const tgExt = path.extname(file.file_path);
-      const localExt = path.extname(filename);
-      const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, '_');
-      const finalName = localExt ? safeName : `${safeName}${tgExt}`;
-      const destPath = path.join(attachDir, finalName);
-
-      const fileUrl = `https://api.telegram.org/file/bot${this.botToken}/${file.file_path}`;
-      const resp = await fetch(fileUrl);
-      if (!resp.ok) {
-        logger.warn({ fileId, status: resp.status }, 'Telegram file download failed');
-        return null;
-      }
-
-      const buffer = Buffer.from(await resp.arrayBuffer());
-      fs.writeFileSync(destPath, buffer);
-
-      logger.info({ fileId, dest: destPath }, 'Telegram file downloaded');
-      return `/workspace/group/attachments/${finalName}`;
-    } catch (err) {
-      logger.error({ fileId, err }, 'Failed to download Telegram file');
-      return null;
-    }
-  }
-
-  async connect(): Promise<void> {
-    this.bot = new Bot(this.botToken, {
-      client: {
-        baseFetchConfig: { agent: https.globalAgent, compress: true },
-      },
-    });
-
-    // Command to get chat ID (useful for registration)
-    this.bot.command('chatid', (ctx) => {
-      const chatId = ctx.chat.id;
-      const chatType = ctx.chat.type;
-      const chatName =
-        chatType === 'private'
-          ? ctx.from?.first_name || 'Private'
-          : (ctx.chat as any).title || 'Unknown';
-
-      ctx.reply(
-        `Chat ID: \`tg:${chatId}\`\nName: ${chatName}\nType: ${chatType}`,
-        { parse_mode: 'Markdown' },
-      );
-    });
-
-    // Command to check bot status
-    this.bot.command('ping', (ctx) => {
-      ctx.reply(`${ASSISTANT_NAME} is online.`);
-    });
-
-    // Telegram bot commands handled above — skip them in the general handler
-    // so they don't also get stored as messages. All other /commands flow through.
-    const TELEGRAM_BOT_COMMANDS = new Set(['chatid', 'ping']);
-
-    this.bot.on('message:text', async (ctx) => {
-      if (ctx.message.text.startsWith('/')) {
-        const cmd = ctx.message.text.slice(1).split(/[\s@]/)[0].toLowerCase();
-        if (TELEGRAM_BOT_COMMANDS.has(cmd)) return;
-      }
-
-      const chatJid = `tg:${ctx.chat.id}`;
-      let content = ctx.message.text;
-      const timestamp = new Date(ctx.message.date * 1000).toISOString();
-      const senderName =
-        ctx.from?.first_name ||
-        ctx.from?.username ||
-        ctx.from?.id.toString() ||
-        'Unknown';
-      const sender = ctx.from?.id.toString() || '';
-      const msgId = ctx.message.message_id.toString();
-      const threadId = ctx.message.message_thread_id;
-
-      const replyTo = ctx.message.reply_to_message;
-      const replyToMessageId = replyTo?.message_id?.toString();
-      const replyToContent = replyTo?.text || replyTo?.caption;
-      const replyToSenderName = replyTo
-        ? replyTo.from?.first_name ||
-          replyTo.from?.username ||
-          replyTo.from?.id?.toString() ||
-          'Unknown'
-        : undefined;
-
-      // Determine chat name
-      const chatName =
-        ctx.chat.type === 'private'
-          ? senderName
-          : (ctx.chat as any).title || chatJid;
-
-      // Translate Telegram @bot_username mentions into TRIGGER_PATTERN format.
-      // Telegram @mentions (e.g., @andy_ai_bot) won't match TRIGGER_PATTERN
-      // (e.g., ^@Andy\b), so we prepend the trigger when the bot is @mentioned.
-      const botUsername = ctx.me?.username?.toLowerCase();
-      if (botUsername) {
-        const entities = ctx.message.entities || [];
-        const isBotMentioned = entities.some((entity) => {
-          if (entity.type === 'mention') {
-            const mentionText = content
-              .substring(entity.offset, entity.offset + entity.length)
-              .toLowerCase();
-            return mentionText === `@${botUsername}`;
-          }
-          return false;
-        });
-        if (isBotMentioned && !TRIGGER_PATTERN.test(content)) {
-          content = `@${ASSISTANT_NAME} ${content}`;
-        }
-      }
-
-      // Store chat metadata for discovery
-      const isGroup =
-        ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
-      this.opts.onChatMetadata(
-        chatJid,
-        timestamp,
-        chatName,
-        'telegram',
-        isGroup,
-      );
-
-      // Only deliver full message for registered groups
-      const group = this.opts.registeredGroups()[chatJid];
-      if (!group) {
-        logger.debug(
-          { chatJid, chatName },
-          'Message from unregistered Telegram chat',
-        );
+      const botUsername = await botUsernamePromise;
+      if (!botUsername) {
+        hostOnInbound(platformId, threadId, message);
         return;
       }
-
-      // Deliver message — startMessageLoop() will pick it up
-      this.opts.onMessage(chatJid, {
-        id: msgId,
-        chat_jid: chatJid,
-        sender,
-        sender_name: senderName,
-        content,
-        timestamp,
-        is_from_me: false,
-        thread_id: threadId ? threadId.toString() : undefined,
-        reply_to_message_id: replyToMessageId,
-        reply_to_message_content: replyToContent,
-        reply_to_sender_name: replyToSenderName,
-      });
-
-      logger.info(
-        { chatJid, chatName, sender: senderName },
-        'Telegram message stored',
-      );
-    });
-
-    // Handle non-text messages: download files when possible, fall back to placeholders.
-    const storeMedia = (
-      ctx: any,
-      placeholder: string,
-      opts?: { fileId?: string; filename?: string },
-    ) => {
-      const chatJid = `tg:${ctx.chat.id}`;
-      const group = this.opts.registeredGroups()[chatJid];
-      if (!group) return;
-
-      const timestamp = new Date(ctx.message.date * 1000).toISOString();
-      const senderName =
-        ctx.from?.first_name ||
-        ctx.from?.username ||
-        ctx.from?.id?.toString() ||
-        'Unknown';
-      const caption = ctx.message.caption ? ` ${ctx.message.caption}` : '';
-
-      const isGroup =
-        ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
-      this.opts.onChatMetadata(
-        chatJid,
-        timestamp,
-        undefined,
-        'telegram',
-        isGroup,
-      );
-
-      const deliver = (content: string) => {
-        this.opts.onMessage(chatJid, {
-          id: ctx.message.message_id.toString(),
-          chat_jid: chatJid,
-          sender: ctx.from?.id?.toString() || '',
-          sender_name: senderName,
-          content,
-          timestamp,
-          is_from_me: false,
-        });
-      };
-
-      // If we have a file_id, attempt to download; deliver asynchronously
-      if (opts?.fileId) {
-        const msgId = ctx.message.message_id.toString();
-        const filename =
-          opts.filename ||
-          `${placeholder.replace(/[\[\] ]/g, '').toLowerCase()}_${msgId}`;
-        this.downloadFile(opts.fileId, group.folder, filename).then(
-          (filePath) => {
-            if (filePath) {
-              deliver(`${placeholder} (${filePath})${caption}`);
-            } else {
-              deliver(`${placeholder}${caption}`);
-            }
-          },
-        );
+      const { text, authorUserId } = readInboundFields(message);
+      if (!text) {
+        hostOnInbound(platformId, threadId, message);
         return;
       }
-
-      deliver(`${placeholder}${caption}`);
-    };
-
-    this.bot.on('message:photo', (ctx) => {
-      // Telegram sends multiple sizes; last is largest
-      const photos = ctx.message.photo;
-      const largest = photos?.[photos.length - 1];
-      storeMedia(ctx, '[Photo]', {
-        fileId: largest?.file_id,
-        filename: `photo_${ctx.message.message_id}`,
+      const consumed = await tryConsume({
+        text,
+        botUsername,
+        platformId,
+        isGroup: isGroupPlatformId(platformId),
+        adminUserId: authorUserId,
       });
-    });
-    this.bot.on('message:video', (ctx) => {
-      storeMedia(ctx, '[Video]', {
-        fileId: ctx.message.video?.file_id,
-        filename: `video_${ctx.message.message_id}`,
-      });
-    });
-    this.bot.on('message:voice', (ctx) => {
-      storeMedia(ctx, '[Voice message]', {
-        fileId: ctx.message.voice?.file_id,
-        filename: `voice_${ctx.message.message_id}`,
-      });
-    });
-    this.bot.on('message:audio', (ctx) => {
-      const name =
-        ctx.message.audio?.file_name || `audio_${ctx.message.message_id}`;
-      storeMedia(ctx, '[Audio]', {
-        fileId: ctx.message.audio?.file_id,
-        filename: name,
-      });
-    });
-    this.bot.on('message:document', (ctx) => {
-      const name = ctx.message.document?.file_name || 'file';
-      storeMedia(ctx, `[Document: ${name}]`, {
-        fileId: ctx.message.document?.file_id,
-        filename: name,
-      });
-    });
-    this.bot.on('message:sticker', (ctx) => {
-      const emoji = ctx.message.sticker?.emoji || '';
-      storeMedia(ctx, `[Sticker ${emoji}]`);
-    });
-    this.bot.on('message:location', (ctx) => storeMedia(ctx, '[Location]'));
-    this.bot.on('message:contact', (ctx) => storeMedia(ctx, '[Contact]'));
-
-    // Handle errors gracefully
-    this.bot.catch((err) => {
-      logger.error({ err: err.message }, 'Telegram bot error');
-    });
-
-    // Start polling — returns a Promise that resolves when started
-    return new Promise<void>((resolve) => {
-      this.bot!.start({
-        onStart: (botInfo) => {
-          logger.info(
-            { username: botInfo.username, id: botInfo.id },
-            'Telegram bot connected',
-          );
-          console.log(`\n  Telegram bot: @${botInfo.username}`);
-          console.log(
-            `  Send /chatid to the bot to get a chat's registration ID\n`,
-          );
-          resolve();
-        },
-      });
-    });
-  }
-
-  async sendMessage(
-    jid: string,
-    text: string,
-    threadId?: string,
-  ): Promise<void> {
-    if (!this.bot) {
-      logger.warn('Telegram bot not initialized');
-      return;
-    }
-
-    try {
-      const numericId = jid.replace(/^tg:/, '');
-      const options = threadId
-        ? { message_thread_id: parseInt(threadId, 10) }
-        : {};
-
-      // Telegram has a 4096 character limit per message — split if needed
-      const MAX_LENGTH = 4096;
-      if (text.length <= MAX_LENGTH) {
-        await sendTelegramMessage(this.bot.api, numericId, text, options);
+      if (!consumed) {
+        hostOnInbound(platformId, threadId, message);
+        return;
+      }
+      // Pairing matched — record the chat and short-circuit so the
+      // code-bearing message never reaches an agent. Privilege is now a
+      // property of the paired user, not the chat: upsert the user, and if
+      // this instance has no owner yet, promote them to owner.
+      const existing = getMessagingGroupByPlatform('telegram', platformId);
+      if (existing) {
+        updateMessagingGroup(existing.id, {
+          is_group: consumed.consumed!.isGroup ? 1 : 0,
+        });
       } else {
-        for (let i = 0; i < text.length; i += MAX_LENGTH) {
-          await sendTelegramMessage(
-            this.bot.api,
-            numericId,
-            text.slice(i, i + MAX_LENGTH),
-            options,
-          );
-        }
+        createMessagingGroup({
+          id: `mg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          channel_type: 'telegram',
+          platform_id: platformId,
+          name: consumed.consumed!.name,
+          is_group: consumed.consumed!.isGroup ? 1 : 0,
+          unknown_sender_policy: 'strict',
+          created_at: new Date().toISOString(),
+        });
       }
-      logger.info(
-        { jid, length: text.length, threadId },
-        'Telegram message sent',
-      );
+
+      const pairedUserId = `telegram:${consumed.consumed!.adminUserId}`;
+      upsertUser({
+        id: pairedUserId,
+        kind: 'telegram',
+        display_name: null,
+        created_at: new Date().toISOString(),
+      });
+
+      let promotedToOwner = false;
+      if (!hasAnyOwner()) {
+        grantRole({
+          user_id: pairedUserId,
+          role: 'owner',
+          agent_group_id: null,
+          granted_by: null,
+          granted_at: new Date().toISOString(),
+        });
+        promotedToOwner = true;
+      }
+
+      log.info('Telegram pairing accepted — chat registered', {
+        platformId,
+        pairedUser: pairedUserId,
+        promotedToOwner,
+        intent: consumed.intent,
+      });
+
+      await sendPairingConfirmation(token, platformId);
     } catch (err) {
-      logger.error({ jid, err }, 'Failed to send Telegram message');
+      log.error('Telegram pairing interceptor error', { err });
+      // Fail open: pass through so a pairing bug doesn't break normal traffic.
+      hostOnInbound(platformId, threadId, message);
     }
-  }
-
-  isConnected(): boolean {
-    return this.bot !== null;
-  }
-
-  ownsJid(jid: string): boolean {
-    return jid.startsWith('tg:');
-  }
-
-  async disconnect(): Promise<void> {
-    if (this.bot) {
-      this.bot.stop();
-      this.bot = null;
-      logger.info('Telegram bot stopped');
-    }
-  }
-
-  async setTyping(jid: string, isTyping: boolean): Promise<void> {
-    if (!this.bot || !isTyping) return;
-    try {
-      const numericId = jid.replace(/^tg:/, '');
-      await this.bot.api.sendChatAction(numericId, 'typing');
-    } catch (err) {
-      logger.debug({ jid, err }, 'Failed to send Telegram typing indicator');
-    }
-  }
+  };
 }
 
-registerChannel('telegram', (opts: ChannelOpts) => {
-  const envVars = readEnvFile(['TELEGRAM_BOT_TOKEN']);
-  const token =
-    process.env.TELEGRAM_BOT_TOKEN || envVars.TELEGRAM_BOT_TOKEN || '';
-  if (!token) {
-    logger.warn('Telegram: TELEGRAM_BOT_TOKEN not set');
-    return null;
-  }
-  return new TelegramChannel(token, opts);
+registerChannelAdapter('telegram', {
+  factory: () => {
+    const env = readEnvFile(['TELEGRAM_BOT_TOKEN']);
+    if (!env.TELEGRAM_BOT_TOKEN) return null;
+    const token = env.TELEGRAM_BOT_TOKEN;
+    const telegramAdapter = createTelegramAdapter({
+      botToken: token,
+      mode: 'polling',
+    });
+    const bridge = createChatSdkBridge({
+      adapter: telegramAdapter,
+      concurrency: 'concurrent',
+      extractReplyContext,
+      supportsThreads: false,
+      transformOutboundText: sanitizeTelegramLegacyMarkdown,
+      maxTextLength: 4000,
+    });
+
+    const botUsernamePromise = fetchBotUsername(token);
+
+    const wrapped: ChannelAdapter = {
+      ...bridge,
+      resolveChannelName: async (platformId: string) => {
+        const chatId = platformId.split(':').slice(1).join(':');
+        if (!chatId) return null;
+        try {
+          const res = await fetch(`https://api.telegram.org/bot${token}/getChat`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ chat_id: chatId }),
+          });
+          const data = (await res.json()) as { ok?: boolean; result?: { title?: string } };
+          return data.ok ? (data.result?.title ?? null) : null;
+        } catch {
+          return null;
+        }
+      },
+      async setup(hostConfig: ChannelSetup) {
+        const intercepted: ChannelSetup = {
+          ...hostConfig,
+          onInbound: createPairingInterceptor(botUsernamePromise, hostConfig.onInbound, token),
+        };
+        return withRetry(() => bridge.setup(intercepted), 'bridge.setup');
+      },
+    };
+    return wrapped;
+  },
 });
