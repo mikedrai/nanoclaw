@@ -51,6 +51,11 @@ function socketPath(): string {
 function createAdapter(): ChannelAdapter {
   let server: net.Server | null = null;
   let client: net.Socket | null = null;
+  // Per-platform reply sinks for routed admin-transport connections — e.g. the
+  // Enorasi website talking to ONE student's agent over cli/web:<folder> and
+  // reading the reply back on the same socket. Additive: the single-client
+  // `client`/local chat path below is unchanged.
+  const subscribers = new Map<string, net.Socket>();
 
   const adapter: ChannelAdapter = {
     name: 'cli',
@@ -117,17 +122,18 @@ function createAdapter(): ChannelAdapter {
     },
 
     async deliver(platformId, _threadId, message: OutboundMessage): Promise<string | undefined> {
-      if (platformId !== PLATFORM_ID) return undefined;
-      if (!client) {
-        // No live terminal — outbound row is already persisted, so this
-        // isn't a data loss. User will see it on the next connect cycle
-        // (or never, if we don't add scroll-back). Not worth throwing.
+      // 'local' goes to the single interactive chat client; any other platform
+      // is a routed admin transport whose socket registered as a subscriber.
+      const sink = platformId === PLATFORM_ID ? client : subscribers.get(platformId);
+      if (!sink) {
+        // No live terminal/subscriber — outbound row is already persisted, so
+        // this isn't a data loss. Not worth throwing.
         return undefined;
       }
       const text = extractText(message);
       if (text === null) return undefined;
       try {
-        client.write(JSON.stringify({ text }) + '\n');
+        sink.write(JSON.stringify({ text }) + '\n');
       } catch (err) {
         log.warn('Failed to write to CLI client', { err });
       }
@@ -164,12 +170,13 @@ function createAdapter(): ChannelAdapter {
         const line = buffer.slice(0, idx).trim();
         buffer = buffer.slice(idx + 1);
         if (!line) continue;
-        void handleLine(line, config, claimChatSlot);
+        void handleLine(line, config, claimChatSlot, socket);
       }
     });
 
     socket.on('close', () => {
       if (client === socket) client = null;
+      for (const [plat, sock] of subscribers) if (sock === socket) subscribers.delete(plat);
       if (claimedChatSlot) log.info('CLI client disconnected');
     });
 
@@ -178,7 +185,12 @@ function createAdapter(): ChannelAdapter {
     });
   }
 
-  async function handleLine(line: string, config: ChannelSetup, claimChatSlot: () => void): Promise<void> {
+  async function handleLine(
+    line: string,
+    config: ChannelSetup,
+    claimChatSlot: () => void,
+    socket: net.Socket,
+  ): Promise<void> {
     let payload: {
       text?: unknown;
       to?: unknown;
@@ -201,6 +213,13 @@ function createAdapter(): ChannelAdapter {
       // Routed message — admin transport. Build a full InboundEvent targeting
       // `to`'s channel/platform, and let `reply_to` (if any) redirect replies.
       // Does NOT claim the chat slot, so an active terminal chat isn't evicted.
+      //
+      // Register this socket to receive the routed reply. The reply mirrors the
+      // source (`to`) unless `reply_to` redirects it — so subscribe under that
+      // effective cli platform id. Lets one cli.sock multiplex many agents.
+      const replyPlat =
+        replyTo && replyTo.channelType === 'cli' ? replyTo.platformId : to.channelType === 'cli' ? to.platformId : null;
+      if (replyPlat) subscribers.set(replyPlat, socket);
       const event: InboundEvent = {
         channelType: to.channelType,
         platformId: to.platformId,
