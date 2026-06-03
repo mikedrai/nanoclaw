@@ -26,6 +26,7 @@ import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContaine
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
+import { readEnvFile } from './env.js';
 import { initGroupFilesystem } from './group-init.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
@@ -410,6 +411,18 @@ async function buildContainerArgs(
   // Environment — only vars read by code we don't own.
   // Everything NanoClaw-specific is in container.json (read by runner at startup).
   args.push('-e', `TZ=${TIMEZONE}`);
+
+  // Gemini provider key. Claude credentials are injected by the OneCLI gateway
+  // (HTTPS_PROXY), but the @google/genai SDK needs a real key value at
+  // construction time, so we inject the host's GEMINI_API_KEY into this one
+  // container when set. Read via readEnvFile (not process.env) to match the
+  // codebase's secret-hygiene rule — keep keys out of the host process env and
+  // its other children; scope the injection to the agent container that needs
+  // it. Harmless for the Claude provider, which ignores it.
+  const geminiKey = readEnvFile(['GEMINI_API_KEY']).GEMINI_API_KEY || process.env.GEMINI_API_KEY;
+  if (geminiKey) {
+    args.push('-e', `GEMINI_API_KEY=${geminiKey}`);
+  }
 
   // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).
   if (providerContribution.env) {
