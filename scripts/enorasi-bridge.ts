@@ -141,6 +141,7 @@ function readBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
 
 const server = http.createServer(async (req, res) => {
   const send = (code: number, obj: unknown) => {
+    console.log(`[enorasi-bridge] ${req.method} ${req.url} -> ${code}`);
     res.writeHead(code, { 'content-type': 'application/json' });
     res.end(JSON.stringify(obj));
   };
@@ -186,6 +187,7 @@ const server = http.createServer(async (req, res) => {
     }
     return send(404, { error: 'not found' });
   } catch (e) {
+    console.error(`[enorasi-bridge] ${req.method} ${req.url} ERROR:`, e instanceof Error ? e.message : e);
     return send(500, { error: e instanceof Error ? e.message : 'bridge error' });
   }
 });
