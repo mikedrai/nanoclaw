@@ -16,6 +16,12 @@ FROM node:22-slim
 # CJK fonts add ~200MB. Opt in only if you render Chinese/Japanese/Korean text.
 ARG INSTALL_CJK_FONTS=false
 
+# Browser automation (chromium + the X11/GTK libs + agent-browser) adds
+# ~300–500MB to the image. Default on. Build with --build-arg INSTALL_BROWSER=false
+# for a LEAN image — e.g. student agents that only do document/data work and
+# never open a web page. Also acts as a hard guardrail: no chromium, no browsing.
+ARG INSTALL_BROWSER=true
+
 # Pin CLI versions for reproducibility. Bump deliberately — unpinned installs
 # mean every rebuild silently picks up the latest and can break in lockstep
 # across all users.
@@ -26,31 +32,35 @@ ARG BUN_VERSION=1.3.12
 
 # ---- System dependencies -----------------------------------------------------
 # tini: correct PID 1 / signal forwarding so outbound.db writes finalize on
-# SIGTERM instead of being orphaned by the shell entrypoint.
+# SIGTERM instead of being orphaned by the shell entrypoint. The chromium +
+# X11/GTK libs are only installed when INSTALL_BROWSER=true.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends \
-        chromium \
-        fonts-liberation \
-        fonts-noto-color-emoji \
-        libgbm1 \
-        libnss3 \
-        libatk-bridge2.0-0 \
-        libgtk-3-0 \
-        libx11-xcb1 \
-        libxcomposite1 \
-        libxdamage1 \
-        libxrandr2 \
-        libasound2 \
-        libpangocairo-1.0-0 \
-        libcups2 \
-        libdrm2 \
-        libxshmfence1 \
         ca-certificates \
         curl \
         git \
         tini \
         unzip \
+        fonts-liberation \
+        fonts-noto-color-emoji \
+    && if [ "$INSTALL_BROWSER" = "true" ]; then \
+        apt-get install -y --no-install-recommends \
+          chromium \
+          libgbm1 \
+          libnss3 \
+          libatk-bridge2.0-0 \
+          libgtk-3-0 \
+          libx11-xcb1 \
+          libxcomposite1 \
+          libxdamage1 \
+          libxrandr2 \
+          libasound2 \
+          libpangocairo-1.0-0 \
+          libcups2 \
+          libdrm2 \
+          libxshmfence1; \
+       fi \
     && if [ "$INSTALL_CJK_FONTS" = "true" ]; then \
         apt-get install -y --no-install-recommends fonts-noto-cjk; \
        fi \
@@ -104,8 +114,13 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
     echo "only-built-dependencies[]=@anthropic-ai/claude-code" >> /root/.npmrc && \
     pnpm install -g "vercel@${VERCEL_VERSION}"
 
+# agent-browser only when INSTALL_BROWSER=true (skipped for the lean image).
 RUN --mount=type=cache,target=/root/.cache/pnpm \
-    pnpm install -g "agent-browser@${AGENT_BROWSER_VERSION}"
+    if [ "$INSTALL_BROWSER" = "true" ]; then \
+      pnpm install -g "agent-browser@${AGENT_BROWSER_VERSION}"; \
+    else \
+      echo "INSTALL_BROWSER=false — skipping agent-browser"; \
+    fi
 
 RUN --mount=type=cache,target=/root/.cache/pnpm \
     pnpm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"

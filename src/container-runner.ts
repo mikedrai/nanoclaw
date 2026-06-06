@@ -10,9 +10,12 @@ import path from 'path';
 import { OneCLI } from '@onecli-sh/sdk';
 
 import {
+  CONTAINER_CPUS,
   CONTAINER_IMAGE,
   CONTAINER_IMAGE_BASE,
   CONTAINER_INSTALL_LABEL,
+  CONTAINER_MEMORY,
+  CONTAINER_PIDS,
   DATA_DIR,
   GROUPS_DIR,
   ONECLI_API_KEY,
@@ -407,6 +410,13 @@ async function buildContainerArgs(
   agentIdentifier?: string,
 ): Promise<string[]> {
   const args: string[] = ['run', '--rm', '--name', containerName, '--label', CONTAINER_INSTALL_LABEL];
+
+  // Per-agent resource caps (when configured) — keep each agent within its
+  // RAM/CPU/PID budget so the host can't be overrun. --memory-swap == --memory
+  // disables swap, making the memory cap hard. Empty values = unlimited.
+  if (CONTAINER_MEMORY) args.push('--memory', CONTAINER_MEMORY, '--memory-swap', CONTAINER_MEMORY);
+  if (CONTAINER_CPUS) args.push('--cpus', CONTAINER_CPUS);
+  if (CONTAINER_PIDS) args.push('--pids-limit', CONTAINER_PIDS);
 
   // Environment — only vars read by code we don't own.
   // Everything NanoClaw-specific is in container.json (read by runner at startup).

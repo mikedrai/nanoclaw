@@ -32,6 +32,16 @@ if [ "${INSTALL_CJK_FONTS:-false}" = "true" ]; then
     BUILD_ARGS+=(--build-arg INSTALL_CJK_FONTS=true)
 fi
 
+# Browser automation defaults ON; set INSTALL_BROWSER=false in .env for a lean
+# image (no chromium/agent-browser) — e.g. student agents that never browse.
+if [ -z "${INSTALL_BROWSER:-}" ] && [ -f "../.env" ]; then
+    INSTALL_BROWSER="$(grep '^INSTALL_BROWSER=' ../.env | tail -n1 | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d '[:space:]')"
+fi
+if [ "${INSTALL_BROWSER:-true}" = "false" ]; then
+    echo "Browser automation: DISABLED (lean image)"
+    BUILD_ARGS+=(--build-arg INSTALL_BROWSER=false)
+fi
+
 echo "Building NanoClaw agent container image..."
 echo "Image: ${IMAGE_NAME}:${TAG}"
 

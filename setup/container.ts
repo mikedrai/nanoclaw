@@ -171,16 +171,20 @@ export async function run(args: string[]): Promise<void> {
   const buildCmd = 'docker build';
   const runCmd = 'docker';
 
-  // Build-args from .env. Only INSTALL_CJK_FONTS is passed through today.
-  // Keeps /setup and ./container/build.sh in sync — both read the same source.
+  // Build-args from .env. Keeps /setup and ./container/build.sh in sync —
+  // both read the same source. INSTALL_CJK_FONTS defaults off (pass when true);
+  // INSTALL_BROWSER defaults on (pass --build-arg only when explicitly false,
+  // for a lean no-browser image).
   const buildArgs: string[] = [];
   try {
     const fs = await import('fs');
     const envPath = path.join(projectRoot, '.env');
     if (fs.existsSync(envPath)) {
-      const match = fs.readFileSync(envPath, 'utf-8').match(/^INSTALL_CJK_FONTS=(.+)$/m);
-      const val = match?.[1].trim().replace(/^["']|["']$/g, '').toLowerCase();
-      if (val === 'true') buildArgs.push('--build-arg INSTALL_CJK_FONTS=true');
+      const env = fs.readFileSync(envPath, 'utf-8');
+      const cjk = env.match(/^INSTALL_CJK_FONTS=(.+)$/m)?.[1].trim().replace(/^["']|["']$/g, '').toLowerCase();
+      if (cjk === 'true') buildArgs.push('--build-arg INSTALL_CJK_FONTS=true');
+      const browser = env.match(/^INSTALL_BROWSER=(.+)$/m)?.[1].trim().replace(/^["']|["']$/g, '').toLowerCase();
+      if (browser === 'false') buildArgs.push('--build-arg INSTALL_BROWSER=false');
     }
   } catch {
     // .env is optional; absence is normal on a fresh checkout
