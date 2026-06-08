@@ -22,6 +22,11 @@ export function openInboundDb(dbPath: string): Database.Database {
   const db = new Database(dbPath);
   db.pragma('journal_mode = DELETE');
   db.pragma('busy_timeout = 5000');
+  // Ensure the schema exists before any caller migrates/queries: a session's
+  // inbound.db can be opened fresh (first message, or the file was recreated)
+  // without ensureSchema() having run, which used to crash routing with
+  // "no such table: messages_in". CREATE TABLE IF NOT EXISTS — idempotent + cheap.
+  db.exec(INBOUND_SCHEMA);
   return db;
 }
 
