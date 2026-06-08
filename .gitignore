@@ -39,3 +39,7 @@ groups/*
 .nanoclaw/
 
 agents-sdk-docs
+
+# Taso prod secrets (read-only DB pw + admin service token) — never commit
+.taso_ro_pw
+.taso_admin_token
