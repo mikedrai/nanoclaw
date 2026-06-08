@@ -112,7 +112,14 @@ rl.on("line", async (line) => {
       const out = await callAction(name, params?.arguments || {});
       let text;
       if (out.data && out.data.needsConfirm) {
-        text = `CONFIRMATION REQUIRED before "${name}": ${out.data.summary}\nShow this to the user; if they approve, call again with "confirm": true.`;
+        text =
+          `⚠️ CONFIRMATION REQUIRED — "${name}" was NOT executed (nothing changed).\n` +
+          `${out.data.summary}\n\n` +
+          `This is irreversible. The user's request is the REQUEST, not the confirmation. ` +
+          `Do NOT call this tool again with "confirm": true in this turn. STOP now: reply to the ` +
+          `user stating exactly what will be permanently changed and that it cannot be undone, and ` +
+          `ask them to confirm. Only after they reply in a SEPARATE, new message explicitly ` +
+          `approving (e.g. "yes" / "confirm") may you call "${name}" again with "confirm": true.`;
       } else if (out.ok) {
         text = `OK: ${JSON.stringify(out.data?.result ?? out.data)}`;
       } else {
