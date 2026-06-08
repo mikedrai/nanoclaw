@@ -27,10 +27,44 @@ import { promisify } from 'node:util';
 import { writeFileSync, mkdtempSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { timingSafeEqual } from 'node:crypto';
 
 const execFileAsync = promisify(execFile);
 const ROOT = process.cwd(); // launched from the nanoclaw root (/opt/nanoclaw)
 const SOCK = join(ROOT, 'data', 'cli.sock');
+
+/**
+ * Cap one agent's daily LLM requests at the OneCLI proxy — the real per-student
+ * spend ceiling (applies on EVERY channel, web + Telegram). Best-effort: never
+ * blocks provisioning. Scopes a rate_limit rule on api.anthropic.com to this agent.
+ */
+async function applyDailyLlmCap(agentGroupId: string, agentName: string, cap: number): Promise<void> {
+  const ONECLI = envVar('ONECLI_BIN') || join(process.env.HOME || '/home/deploy', '.local', 'bin', 'onecli');
+  const { stdout } = await execFileAsync(ONECLI, ['agents', 'list']);
+  const agents = (JSON.parse(stdout).data ?? []) as Array<{ id: string; name: string; identifier: string }>;
+  let found = agents.find((a) => a.identifier === agentGroupId) || agents.find((a) => a.name === agentName);
+  if (!found) {
+    // OneCLI registers an agent lazily on its first run; pre-create it here so the
+    // cap applies from the very first message. nanoclaw's `onecli run` reuses it by identifier.
+    const created = JSON.parse((await execFileAsync(ONECLI, ['agents', 'create', '--name', agentName, '--identifier', agentGroupId])).stdout);
+    found = { id: created.id, name: created.name, identifier: created.identifier };
+  }
+  const agent = found;
+  const rules = (JSON.parse((await execFileAsync(ONECLI, ['rules', 'list'])).stdout).data ?? []) as Array<{ agentId: string; hostPattern: string; action: string }>;
+  if (rules.some((r) => r.agentId === agent.id && r.hostPattern === 'api.anthropic.com' && r.action === 'rate_limit')) {
+    console.log(`[enorasi-bridge] daily LLM cap already present for ${agent.name} (${agent.id})`);
+    return;
+  }
+  await execFileAsync(ONECLI, ['rules', 'create',
+    '--name', `daily-llm-cap-${cap}`,
+    '--host-pattern', 'api.anthropic.com',
+    '--action', 'rate_limit',
+    '--rate-limit', String(cap),
+    '--rate-limit-window', 'day',
+    '--agent-id', agent.id,
+    '--enabled']);
+  console.log(`[enorasi-bridge] daily LLM cap ${cap}/day set for ${agent.name} (${agent.id})`);
+}
 
 function envVar(key: string): string | undefined {
   if (process.env[key]) return process.env[key];
@@ -44,9 +78,21 @@ function envVar(key: string): string | undefined {
 
 const TOKEN = envVar('BRIDGE_TOKEN');
 const PORT = parseInt(envVar('BRIDGE_PORT') || '10260', 10);
+// Bind to the docker bridge gateway (host.docker.internal → 172.17.0.1 from the
+// web container) rather than 0.0.0.0, so the listen socket is unreachable from
+// the public NIC regardless of UFW state. Override with BRIDGE_BIND if needed.
+const BIND = envVar('BRIDGE_BIND') || '172.17.0.1';
 if (!TOKEN) {
   console.error('[enorasi-bridge] BRIDGE_TOKEN is required');
   process.exit(1);
+}
+
+/** Constant-time bearer check (avoids a token-length/byte timing oracle). */
+function authOk(header: string | undefined): boolean {
+  if (!header) return false;
+  const a = Buffer.from(header);
+  const b = Buffer.from(`Bearer ${TOKEN}`);
+  return a.length === b.length && timingSafeEqual(a, b);
 }
 
 function tmpFile(content: string, name: string): string {
@@ -148,7 +194,7 @@ const server = http.createServer(async (req, res) => {
   try {
     const url = req.url || '';
     if (req.method === 'GET' && url === '/health') return send(200, { ok: true });
-    if (req.headers.authorization !== `Bearer ${TOKEN}`) return send(401, { error: 'unauthorized' });
+    if (!authOk(req.headers.authorization)) return send(401, { error: 'unauthorized' });
     if (req.method !== 'POST') return send(404, { error: 'not found' });
 
     const b = await readBody(req);
@@ -163,7 +209,14 @@ const server = http.createServer(async (req, res) => {
       if (s('model')) args.push('--model', s('model')!);
       const out = await runScript('scripts/provision-student.ts', args);
       const last = out.trim().split('\n').filter(Boolean).pop() ?? '{}';
-      return send(200, JSON.parse(last));
+      const result = JSON.parse(last);
+      try {
+        const cap = parseInt((typeof b.dailyRequestCap === 'number' ? String(b.dailyRequestCap) : s('dailyRequestCap')) || '100', 10);
+        if (result.agentGroupId && cap > 0) await applyDailyLlmCap(result.agentGroupId, s('agentName')!, cap);
+      } catch (e) {
+        console.error('[enorasi-bridge] daily LLM cap failed:', e instanceof Error ? e.message : e);
+      }
+      return send(200, result);
     }
     if (url === '/reconfigure') {
       const instr = tmpFile((s('instructions') ?? ''), 'CLAUDE.local.md');
@@ -172,6 +225,12 @@ const server = http.createServer(async (req, res) => {
       if (s('provider')) args.push('--provider', s('provider')!);
       if (s('model')) args.push('--model', s('model')!);
       await runScript('scripts/manage-student.ts', args);
+      try {
+        const cap = parseInt((typeof b.dailyRequestCap === 'number' ? String(b.dailyRequestCap) : s('dailyRequestCap')) || '100', 10);
+        if (cap > 0) await applyDailyLlmCap(s('agentGroupId')!, s('assistantName')!, cap);
+      } catch (e) {
+        console.error('[enorasi-bridge] reconfigure cap failed:', e instanceof Error ? e.message : e);
+      }
       return send(200, { ok: true });
     }
     if (url === '/stop' || url === '/start' || url === '/destroy') {
@@ -183,6 +242,10 @@ const server = http.createServer(async (req, res) => {
     }
     if (url === '/chat') {
       const reply = await askAgent(s('text') ?? '', b.to as ChatRoute | undefined);
+      // Best-effort: surface the daily LLM cap (OneCLI returns 429 to the agent) to the website.
+      if (/\b429\b|rate.?limit|too many requests|quota (exceeded|reached)|daily limit reached/i.test(reply)) {
+        return send(429, { error: 'daily LLM limit reached', code: 'rate_limited' });
+      }
       return send(200, { reply });
     }
     return send(404, { error: 'not found' });
@@ -192,4 +255,4 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, '0.0.0.0', () => console.log(`[enorasi-bridge] listening on :${PORT}`));
+server.listen(PORT, BIND, () => console.log(`[enorasi-bridge] listening on ${BIND}:${PORT}`));
