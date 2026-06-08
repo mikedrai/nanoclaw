@@ -218,6 +218,17 @@ const server = http.createServer(async (req, res) => {
       }
       return send(200, result);
     }
+    if (url === '/provision-admin-agent') {
+      const out = await runScript('scripts/provision-taso.mts', []);
+      const last = out.trim().split('\n').filter(Boolean).pop() ?? '{}';
+      let result: { agentGroupId?: string } = {};
+      try { result = JSON.parse(last); } catch { /* recipe printed non-JSON */ }
+      // bounce Taso's container so it respawns with the converged config (nanoclaw
+      // re-reads container_configs on each spawn — no full restart needed).
+      try { await execFileAsync('bash', ['-c', 'docker stop $(docker ps -q --filter name=nanoclaw-v2-taso) 2>/dev/null || true']); } catch (e) { console.error('[enorasi-bridge] taso bounce failed:', e instanceof Error ? e.message : e); }
+      return send(200, { ok: true, agentGroupId: result.agentGroupId });
+    }
+
     if (url === '/reconfigure') {
       const instr = tmpFile((s('instructions') ?? ''), 'CLAUDE.local.md');
       const mcp = tmpFile(JSON.stringify(b.mcpConfig ?? {}), 'mcp.json');
