@@ -16,7 +16,7 @@ const NC = '/opt/nanoclaw';
 const DBF = NC + '/data/v2.db';
 const NAME = 'Taso';
 const FOLDER = 'taso';
-const MODEL = 'claude-sonnet-4-0';
+const MODEL = 'claude-haiku-4-5'; // fast model — Taso's work is structured (DB/admin/calendar); Haiku is 2-3x quicker than Sonnet here
 const KB = '/data/kb/taso';
 const INSTR = NC + '/scripts/taso-instructions.md';
 
