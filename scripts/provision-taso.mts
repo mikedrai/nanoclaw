@@ -60,9 +60,9 @@ const pw = readFileSync(NC + '/.taso_ro_pw', 'utf8').trim();
 const adminTok = readFileSync(NC + '/.taso_admin_token', 'utf8').trim();
 const mcp = {
   gmail: { command: 'gmail-mcp', args: [], env: { GMAIL_OAUTH_PATH: '/workspace/extra/.gmail-mcp/gcp-oauth.keys.json', GMAIL_CREDENTIALS_PATH: '/workspace/extra/.gmail-mcp/credentials.json' } },
-  postgres: { command: 'npx', args: ['-y', '@modelcontextprotocol/server-postgres', 'postgresql://taso_ro:' + pw + '@172.17.0.1:5433/enorasi'], env: {} },
-  calendar: { command: 'npx', args: ['-y', '@cocal/google-calendar-mcp@2.6.1'], env: { GOOGLE_OAUTH_CREDENTIALS: '/workspace/extra/.calendar-mcp/gcp-oauth.keys.json', GOOGLE_CALENDAR_MCP_TOKEN_PATH: '/workspace/extra/.calendar-mcp/credentials.json' } },
-  drive: { command: 'npx', args: ['-y', '@modelcontextprotocol/server-gdrive'], env: { GDRIVE_OAUTH_PATH: '/workspace/extra/.gdrive-mcp/gcp-oauth.keys.json', GDRIVE_CREDENTIALS_PATH: '/workspace/extra/.gdrive-mcp/credentials.json' } },
+  postgres: { command: 'mcp-server-postgres', args: ['postgresql://taso_ro:' + pw + '@172.17.0.1:5433/enorasi'], env: {} },
+  calendar: { command: 'google-calendar-mcp', args: [], env: { GOOGLE_OAUTH_CREDENTIALS: '/workspace/extra/.calendar-mcp/gcp-oauth.keys.json', GOOGLE_CALENDAR_MCP_TOKEN_PATH: '/workspace/extra/.calendar-mcp/credentials.json' } },
+  drive: { command: 'mcp-server-gdrive', args: [], env: { GDRIVE_OAUTH_PATH: '/workspace/extra/.gdrive-mcp/gcp-oauth.keys.json', GDRIVE_CREDENTIALS_PATH: '/workspace/extra/.gdrive-mcp/credentials.json' } },
   admin: { command: 'node', args: ['/workspace/extra/.admin-mcp/enorasi-admin-mcp.mjs'], env: { ENORASI_ADMIN_URL: 'https://enorasi.com', TASO_ADMIN_TOKEN: adminTok } },
 };
 const mounts = [
