@@ -38,6 +38,9 @@ const malP = HOME + '/.config/nanoclaw/mount-allowlist.json';
 const mal = JSON.parse(readFileSync(malP, 'utf8'));
 for (const p of ['~/.gmail-mcp', '~/.calendar-mcp', '~/.gdrive-mcp'])
   if (!mal.allowedRoots.some((r: { path: string }) => r.path === p)) mal.allowedRoots.push({ path: p, allowReadWrite: true, description: p + ' OneCLI-managed credential stubs' });
+const adminMcpDir = NC + '/scripts/admin-mcp';
+if (!mal.allowedRoots.some((r: { path: string }) => r.path === adminMcpDir))
+  mal.allowedRoots.push({ path: adminMcpDir, allowReadWrite: false, description: 'Enorasi admin-actions MCP server (read-only)' });
 writeFileSync(malP, JSON.stringify(mal, null, 2));
 
 // 3) Create the base agent only if missing (idempotent; keeps existing pairing)
@@ -54,11 +57,13 @@ const id = row.id;
 
 // 4) Capability layer (always converge)
 const pw = readFileSync(NC + '/.taso_ro_pw', 'utf8').trim();
+const adminTok = readFileSync(NC + '/.taso_admin_token', 'utf8').trim();
 const mcp = {
   gmail: { command: 'gmail-mcp', args: [], env: { GMAIL_OAUTH_PATH: '/workspace/extra/.gmail-mcp/gcp-oauth.keys.json', GMAIL_CREDENTIALS_PATH: '/workspace/extra/.gmail-mcp/credentials.json' } },
   postgres: { command: 'npx', args: ['-y', '@modelcontextprotocol/server-postgres', 'postgresql://taso_ro:' + pw + '@172.17.0.1:5433/enorasi'], env: {} },
   calendar: { command: 'npx', args: ['-y', '@cocal/google-calendar-mcp@2.6.1'], env: { GOOGLE_OAUTH_CREDENTIALS: '/workspace/extra/.calendar-mcp/gcp-oauth.keys.json', GOOGLE_CALENDAR_MCP_TOKEN_PATH: '/workspace/extra/.calendar-mcp/credentials.json' } },
   drive: { command: 'npx', args: ['-y', '@modelcontextprotocol/server-gdrive'], env: { GDRIVE_OAUTH_PATH: '/workspace/extra/.gdrive-mcp/gcp-oauth.keys.json', GDRIVE_CREDENTIALS_PATH: '/workspace/extra/.gdrive-mcp/credentials.json' } },
+  admin: { command: 'node', args: ['/workspace/extra/.admin-mcp/enorasi-admin-mcp.mjs'], env: { ENORASI_ADMIN_URL: 'https://enorasi.com', TASO_ADMIN_TOKEN: adminTok } },
 };
 const mounts = [
   { hostPath: KB, containerPath: 'my-kb', readonly: true },
@@ -68,6 +73,7 @@ const mounts = [
   { hostPath: '~/.gmail-mcp', containerPath: '.gmail-mcp', readonly: false },
   { hostPath: '~/.calendar-mcp', containerPath: '.calendar-mcp', readonly: false },
   { hostPath: '~/.gdrive-mcp', containerPath: '.gdrive-mcp', readonly: false },
+  { hostPath: NC + '/scripts/admin-mcp', containerPath: '.admin-mcp', readonly: true },
 ];
 const instructions = readFileSync(INSTR, 'utf8');
 writeFileSync(NC + '/groups/' + FOLDER + '/CLAUDE.local.md', instructions.endsWith('\n') ? instructions : instructions + '\n');
