@@ -181,6 +181,12 @@ async function main(): Promise<void> {
     if (args.model) scalars.model = args.model;
     if (Object.keys(scalars).length) updateContainerConfigScalars(ag.id, scalars);
   }
+
+  // Scope skills to what an exec's personal assistant needs (NOT the full set).
+  // Keep: connectors (onecli-gateway), onboarding (welcome), self-tweak
+  // (self-customize), web tasks (agent-browser). Drop frontend-engineer, vercel-cli,
+  // slack-/whatsapp-formatting — wasted per-message context + inappropriate tools.
+  updateContainerConfigJson(ag.id, 'skills', ['onecli-gateway', 'welcome', 'self-customize', 'agent-browser']);
   // The website passes its rendered template (single source of truth) via
   // --instructions-file; fall back to the built-in template otherwise.
   const instructions = args.instructionsFile
